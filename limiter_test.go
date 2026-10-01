@@ -157,3 +157,17 @@ func TestQuotaCheckNAllOrNothing(t *testing.T) {
 		}
 	}
 }
+
+func TestTrustedRealIP(t *testing.T) {
+	var got string
+	h := TrustedRealIP(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.RemoteAddr }))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.9:1234"
+	req.Header.Set("True-Client-IP", "6.6.6.6")
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+	req.Header.Set("X-Real-IP", "198.51.100.4")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if got != "198.51.100.4:0" {
+		t.Fatalf("got %s", got)
+	}
+}

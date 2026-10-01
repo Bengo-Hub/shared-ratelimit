@@ -317,3 +317,16 @@ func isNil(rdb redis.UniversalClient) bool {
 	}
 	return false
 }
+
+// TrustedRealIP replaces chi's middleware.RealIP. chi's version copies True-Client-IP,
+// X-Real-IP or the first X-Forwarded-For entry into r.RemoteAddr, and the client controls the
+// first two of those it reaches first, so every IP-keyed limit and audit log downstream could
+// be spoofed. This sets r.RemoteAddr from ClientIP (the ingress-established address) instead.
+func TrustedRealIP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := ClientIP(r); ip != "" {
+			r.RemoteAddr = net.JoinHostPort(ip, "0")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
