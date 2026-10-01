@@ -12,15 +12,22 @@ import (
 
 // Quota is a Redis daily usage-quota counter, for plan/feature metering sourced from a caller-
 // supplied per-request limit (typically read from JWT claims) rather than a fixed config value.
-// Keys are bucketed by calendar day (UTC) and expire after ~25h — this package intentionally
-// does not generalize the period; every known caller of this primitive is daily.
+// Keys are bucketed by calendar day (UTC) and expire after ~25h; every known caller is daily.
 type Quota struct {
-	redis *redis.Client
+	redis redis.UniversalClient
+	// UpgradeURL is returned in the 429 body of RequireQuota.
+	UpgradeURL string
 }
 
+// DefaultUpgradeURL is where RequireQuota points users who hit their plan limit.
+const DefaultUpgradeURL = "https://pricingapi.codevertexafrica.com/upgrade"
+
 // NewQuota creates a new Redis-backed daily quota counter.
-func NewQuota(rdb *redis.Client) *Quota {
-	return &Quota{redis: rdb}
+func NewQuota(rdb redis.UniversalClient) *Quota {
+	if isNil(rdb) {
+		rdb = nil
+	}
+	return &Quota{redis: rdb, UpgradeURL: DefaultUpgradeURL}
 }
 
 // QuotaResult is the result of a Check call.
@@ -32,39 +39,58 @@ type QuotaResult struct {
 	Remaining int    `json:"remaining"`
 }
 
+// quotaScript adds ARGV[1] units and keeps the 25h TTL in one atomic step. If the total would
+// pass the limit (ARGV[2]) the units are taken back and {0, used} is returned, else {1, used}.
+// The TTL is (re)applied whenever the key has none, which also heals keys written by the old
+// INCR-then-EXPIRE code if that crashed between the two calls.
+var quotaScript = redis.NewScript(`
+local n = redis.call("INCRBY", KEYS[1], ARGV[1])
+if redis.call("TTL", KEYS[1]) < 0 then
+  redis.call("EXPIRE", KEYS[1], ARGV[3])
+end
+if n > tonumber(ARGV[2]) then
+  n = redis.call("DECRBY", KEYS[1], ARGV[1])
+  return {0, n}
+end
+return {1, n}`)
+
+const quotaTTLSeconds = 25 * 60 * 60
+
 // Check checks whether scopeID (typically a tenant ID) is within `limit` uses of `feature`
-// today. A limit of -1 means unlimited. A limit of 0 means not configured (allow by default).
+// today and consumes one use. A limit of -1 means unlimited; 0 means not configured (allow).
 func (q *Quota) Check(ctx context.Context, scopeID, feature string, limit int) (*QuotaResult, error) {
+	return q.CheckN(ctx, scopeID, feature, limit, 1)
+}
+
+// CheckN consumes n uses at once, all or nothing: a batch send to 20 recipients either fits
+// in today's quota entirely or consumes nothing. Fails open (allowed) when Redis errors.
+func (q *Quota) CheckN(ctx context.Context, scopeID, feature string, limit, n int) (*QuotaResult, error) {
 	if limit < 0 {
 		return &QuotaResult{Allowed: true, Feature: feature, Limit: -1, Used: 0, Remaining: -1}, nil
 	}
 	if limit == 0 {
 		return &QuotaResult{Allowed: true, Feature: feature, Limit: 0, Used: 0, Remaining: 0}, nil
 	}
+	if n < 1 {
+		n = 1
+	}
+	if q.redis == nil {
+		return &QuotaResult{Allowed: true, Feature: feature, Limit: limit, Remaining: limit}, nil
+	}
 
 	key := fmt.Sprintf("ratelimit:%s:%s:%s", scopeID, feature, time.Now().UTC().Format("2006-01-02"))
-
-	count, err := q.redis.Incr(ctx, key).Result()
-	if err != nil {
+	vals, err := quotaScript.Run(ctx, q.redis, []string{key}, n, limit, quotaTTLSeconds).Int64Slice()
+	if err != nil || len(vals) != 2 {
 		return &QuotaResult{Allowed: true, Feature: feature, Limit: limit, Used: 0, Remaining: limit}, nil
 	}
-
-	if count == 1 {
-		q.redis.Expire(ctx, key, 25*time.Hour)
-	}
-
-	used := int(count)
-	remaining := limit - used
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	if used > limit {
-		q.redis.Decr(ctx, key)
-		return &QuotaResult{Allowed: false, Feature: feature, Limit: limit, Used: limit, Remaining: 0}, nil
-	}
-
-	return &QuotaResult{Allowed: true, Feature: feature, Limit: limit, Used: used, Remaining: remaining}, nil
+	used := int(vals[1])
+	return &QuotaResult{
+		Allowed:   vals[0] == 1,
+		Feature:   feature,
+		Limit:     limit,
+		Used:      used,
+		Remaining: max(limit-used, 0),
+	}, nil
 }
 
 // ClaimsFunc resolves the scope ID (tenant ID) and configured limit for featureKey from the
@@ -109,7 +135,7 @@ func RequireQuota(q *Quota, featureKey string, claimsFn ClaimsFunc) func(http.Ha
 					"feature":     result.Feature,
 					"limit":       result.Limit,
 					"used":        result.Used,
-					"upgrade_url": "https://pricingapi.codevertexafrica.com/upgrade",
+					"upgrade_url": q.UpgradeURL,
 					"message":     fmt.Sprintf("Daily %s limit reached. Upgrade your plan or add overage.", featureKey),
 				})
 				return
