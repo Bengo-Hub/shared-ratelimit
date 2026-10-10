@@ -158,6 +158,27 @@ func TestQuotaCheckNAllOrNothing(t *testing.T) {
 	}
 }
 
+func TestMonthlyQuotaBucketsAndTTL(t *testing.T) {
+	mr, rdb := newRedis(t)
+	daily, monthly := NewQuota(rdb), NewMonthlyQuota(rdb)
+	ctx := context.Background()
+
+	if r, _ := monthly.CheckN(ctx, "t1", "routing", 5, 5); !r.Allowed {
+		t.Fatalf("monthly batch within limit: %+v", r)
+	}
+	if r, _ := monthly.Check(ctx, "t1", "routing", 5); r.Allowed {
+		t.Fatalf("monthly limit must hold across calls: %+v", r)
+	}
+	// The daily counter for the same feature is a separate window.
+	if r, _ := daily.Check(ctx, "t1", "routing", 5); !r.Allowed || r.Used != 1 {
+		t.Fatalf("daily and monthly windows must not share a key: %+v", r)
+	}
+	monthKey := "ratelimit:t1:routing:" + time.Now().UTC().Format("2006-01")
+	if ttl := mr.TTL(monthKey); ttl < 31*24*time.Hour {
+		t.Fatalf("monthly key TTL too short: %v", ttl)
+	}
+}
+
 func TestTrustedRealIP(t *testing.T) {
 	var got string
 	h := TrustedRealIP(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { got = r.RemoteAddr }))

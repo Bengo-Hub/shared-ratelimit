@@ -10,13 +10,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Quota is a Redis daily usage-quota counter, for plan/feature metering sourced from a caller-
+// Quota is a Redis usage-quota counter, for plan/feature metering sourced from a caller-
 // supplied per-request limit (typically read from JWT claims) rather than a fixed config value.
-// Keys are bucketed by calendar day (UTC) and expire after ~25h; every known caller is daily.
+// NewQuota buckets by UTC calendar day (keys expire after ~25h); NewMonthlyQuota buckets by
+// UTC calendar month for the *_per_month plan limits.
 type Quota struct {
 	redis redis.UniversalClient
 	// UpgradeURL is returned in the 429 body of RequireQuota.
 	UpgradeURL string
+	// bucket is the time layout naming the counting window; ttl outlives one window.
+	bucket string
+	ttl    int
 }
 
 // DefaultUpgradeURL is where RequireQuota points users who hit their plan limit.
@@ -24,10 +28,20 @@ const DefaultUpgradeURL = "https://pricingapi.codevertexafrica.com/upgrade"
 
 // NewQuota creates a new Redis-backed daily quota counter.
 func NewQuota(rdb redis.UniversalClient) *Quota {
+	return newQuota(rdb, dayBucket, quotaTTLSeconds)
+}
+
+// NewMonthlyQuota creates a quota counter that resets at the start of each UTC calendar month,
+// for limits named *_per_month.
+func NewMonthlyQuota(rdb redis.UniversalClient) *Quota {
+	return newQuota(rdb, monthBucket, monthTTLSeconds)
+}
+
+func newQuota(rdb redis.UniversalClient, bucket string, ttl int) *Quota {
 	if isNil(rdb) {
 		rdb = nil
 	}
-	return &Quota{redis: rdb, UpgradeURL: DefaultUpgradeURL}
+	return &Quota{redis: rdb, UpgradeURL: DefaultUpgradeURL, bucket: bucket, ttl: ttl}
 }
 
 // QuotaResult is the result of a Check call.
@@ -54,10 +68,16 @@ if n > tonumber(ARGV[2]) then
 end
 return {1, n}`)
 
-const quotaTTLSeconds = 25 * 60 * 60
+const (
+	dayBucket       = "2006-01-02"
+	monthBucket     = "2006-01"
+	quotaTTLSeconds = 25 * 60 * 60
+	// monthTTLSeconds covers the longest month plus a day, like the daily 25h.
+	monthTTLSeconds = 32 * 24 * 60 * 60
+)
 
 // Check checks whether scopeID (typically a tenant ID) is within `limit` uses of `feature`
-// today and consumes one use. A limit of -1 means unlimited; 0 means not configured (allow).
+// in the current window (day or month) and consumes one use. A limit of -1 means unlimited; 0 means not configured (allow).
 func (q *Quota) Check(ctx context.Context, scopeID, feature string, limit int) (*QuotaResult, error) {
 	return q.CheckN(ctx, scopeID, feature, limit, 1)
 }
@@ -78,8 +98,12 @@ func (q *Quota) CheckN(ctx context.Context, scopeID, feature string, limit, n in
 		return &QuotaResult{Allowed: true, Feature: feature, Limit: limit, Remaining: limit}, nil
 	}
 
-	key := fmt.Sprintf("ratelimit:%s:%s:%s", scopeID, feature, time.Now().UTC().Format("2006-01-02"))
-	vals, err := quotaScript.Run(ctx, q.redis, []string{key}, n, limit, quotaTTLSeconds).Int64Slice()
+	bucket, ttl := q.bucket, q.ttl
+	if bucket == "" { // zero-value Quota{} literals keep the daily behaviour
+		bucket, ttl = dayBucket, quotaTTLSeconds
+	}
+	key := fmt.Sprintf("ratelimit:%s:%s:%s", scopeID, feature, time.Now().UTC().Format(bucket))
+	vals, err := quotaScript.Run(ctx, q.redis, []string{key}, n, limit, ttl).Int64Slice()
 	if err != nil || len(vals) != 2 {
 		return &QuotaResult{Allowed: true, Feature: feature, Limit: limit, Used: 0, Remaining: limit}, nil
 	}

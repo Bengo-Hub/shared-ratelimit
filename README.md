@@ -5,8 +5,10 @@ Rate limiting for every Go service, safe at any replica count.
 - **`Limiter`**: request throttling by IP, user or tenant. GCRA (the token bucket stored as one
   timestamp per key) via `github.com/go-redis/redis_rate/v10`: one atomic Lua call per request
   using the Redis server clock, so all pods sharing one Redis enforce one exact limit.
-- **`Quota`**: daily plan/feature metering (limit from JWT claims), one atomic Lua call that
+- **`Quota`**: plan/feature metering (limit from JWT claims), one atomic Lua call that
   increments, keeps the TTL and rolls back on rejection. `CheckN` is all-or-nothing for batches.
+  `NewQuota` counts per UTC day; `NewMonthlyQuota` counts per UTC calendar month, for the
+  `*_per_month` plan limits.
 
 ## Usage
 
@@ -53,6 +55,7 @@ go get github.com/Bengo-Hub/shared-ratelimit@v0.2.0
 
 ## Versions
 
+- v0.3.0: `NewMonthlyQuota` (calendar-month window, 32 day key TTL). Daily `NewQuota` unchanged.
 - v0.2.0: GCRA via redis_rate (atomic across pods), `MiddlewareWith`/`Options`, `Allow`,
   `ClientIP` (no XFF trust), `SkipStreaming`, `ValueKey`, `CompositeKey`, per-pod fallback,
   `UniversalClient`, atomic `Quota` Lua with `CheckN`, configurable `UpgradeURL`.
