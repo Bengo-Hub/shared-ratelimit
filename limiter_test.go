@@ -192,3 +192,24 @@ func TestTrustedRealIP(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 }
+
+// Security audit 2026-11-10: the stream exemption read client-set headers, so any POST (a
+// login, a chat message) sent with "Accept: text/event-stream" skipped every limit. Only GET
+// requests (EventSource and WebSocket upgrades are GETs) are exempt now.
+func TestStreamingExemptionIsGetOnly(t *testing.T) {
+	_, rdb := newRedis(t)
+	h := NewLimiter(rdb, nil, "svc").Middleware(IPKey, 1, time.Hour)(okHandler())
+	for _, hdr := range [][2]string{{"Accept", "text/event-stream"}, {"Upgrade", "websocket"}} {
+		codes := []int{}
+		for i := 0; i < 2; i++ {
+			r := httptest.NewRequest(http.MethodPost, "/login", nil)
+			r.Header.Set(hdr[0], hdr[1])
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			codes = append(codes, rec.Code)
+		}
+		if codes[1] != http.StatusTooManyRequests {
+			t.Fatalf("POST with %s: %v, the second must be limited", hdr[0], codes)
+		}
+	}
+}

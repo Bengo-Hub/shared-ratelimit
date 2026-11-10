@@ -216,11 +216,15 @@ func normalize(o Options) Options {
 // streams (EventSource reconnects must never be throttled into a reconnect storm) and health
 // or metrics probes (kubelet probes share a node IP and must never see a 429).
 func SkipStreaming(r *http.Request) bool {
-	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return true
-	}
-	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-		return true
+	// Only GETs: EventSource and WebSocket upgrades are always GET, and the headers are set by
+	// the client, so a POST (a login, a chat message) claiming to stream is still limited.
+	if r.Method == http.MethodGet {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			return true
+		}
+		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			return true
+		}
 	}
 	switch r.URL.Path {
 	case "/healthz", "/health", "/readyz", "/livez", "/metrics", "/ready", "/live":
